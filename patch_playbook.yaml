@@ -1,13 +1,13 @@
 ---
-- name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi (AWX/K8s uyumlu)
+- name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi
   hosts: suse_hosts
   become: yes
-  serial: "100%"   # Aynı anda tüm hostlar. Prod için genelde 1 önerilir.
+  serial: "100%"   # Prod için genelde 1 önerilir
 
   vars:
     reboot_timeout: 1200
 
-    # Zypper patch sırasında en sık çakışma çıkaran (server'da çoğunlukla gereksiz) paketler
+    # Server ortamında gereksiz olup patch sırasında conflict çıkaran paketler
     conflict_packages:
       - libyui-qt-pkg16
       - PackageKit
@@ -17,30 +17,34 @@
 
   tasks:
 
-    # --- 1. ADIM: İŞLEM ÖNCESİ DURUM ---
-    - name: 1.1. Mevcut (Eski) Kernel sürümünü kaydet
+    # --------------------------------------------------
+    # 1. İŞLEM ÖNCESİ DURUM
+    # --------------------------------------------------
+    - name: 1.1 Mevcut kernel sürümünü al
       ansible.builtin.command: uname -r
       register: pre_kernel
       changed_when: false
 
-    - name: 1.2. Bekleyen yama listesini kontrol et (Bilgi amaçlı)
+    - name: 1.2 Bekleyen patch listesini al (bilgi)
       ansible.builtin.command: zypper list-patches
       register: patch_list_before
       changed_when: false
 
-    - name: 1.3. Patch listesi (öncesi)
+    - name: 1.3 Patch listesi (öncesi)
       ansible.builtin.debug:
         var: patch_list_before.stdout_lines
 
-    # --- 2. ADIM: PATCH ÖNCESİ DEPENDENCY CONFLICT ÖNLEME ---
-    - name: 2.0. Conflict çıkaran paketler sistemde kurulu mu kontrol et
-      ansible.builtin.shell: "rpm -q {{ item }}"
+    # --------------------------------------------------
+    # 2. PATCH ÖNCESİ CONFLICT ÖNLEME
+    # --------------------------------------------------
+    - name: 2.1 Conflict paketler kurulu mu kontrol et
+      ansible.builtin.shell: rpm -q {{ item }}
       loop: "{{ conflict_packages }}"
       register: conflict_pkg_check
       failed_when: false
       changed_when: false
 
-    - name: 2.0.1. Kurulu olan conflict paket listesini çıkar
+    - name: 2.2 Kurulu conflict paket listesini oluştur
       ansible.builtin.set_fact:
         installed_conflict_packages: >-
           {{
@@ -50,66 +54,79 @@
             | list
           }}
 
-    - name: 2.0.2. Kurulu conflict paketleri (bilgi)
+    - name: 2.3 Kurulu conflict paketleri (bilgi)
       ansible.builtin.debug:
         msg: "Kurulu conflict paketleri: {{ installed_conflict_packages | default([]) }}"
 
-    - name: 2.0.3. Kuruluysa conflict paketlerini kaldır (zypper interaktif kalmasın diye)
-      ansible.builtin.command: "zypper rm -y {{ installed_conflict_packages | join(' ') }}"
-      register: remove_conflict_pkgs
+    - name: 2.4 Kuruluysa conflict paketleri kaldır
+      ansible.builtin.command: zypper rm -y {{ installed_conflict_packages | join(' ') }}
       when: installed_conflict_packages | length > 0
-      changed_when: remove_conflict_pkgs.rc == 0
       failed_when: false
 
-    # --- 3. ADIM: YAMA UYGULAMA ---
-    - name: 3.1. Tüm onaylı yamaları yükle (zypper patch)
+    # --------------------------------------------------
+    # 3. PATCH UYGULAMA (RC=103 AWARE)
+    # --------------------------------------------------
+    - name: 3.1 Patch uygula (1. tur)
       ansible.builtin.command: zypper patch -y
-      register: patch_result
-      # "Nothing to do." yoksa değişiklik olmuştur
-      changed_when: "'Nothing to do.' not in patch_result.stdout"
-      # rc != 0 olursa job fail etsin (artık interaktif kalmayacağı için beklenmez)
-      failed_when: patch_result.rc != 0
+      register: patch_result_1
+      changed_when: "'Nothing to do.' not in patch_result_1.stdout"
+      failed_when: patch_result_1.rc not in [0, 103]
 
-    # --- 4. ADIM: REBOOT GEREKLİLİK KONTROLÜ ---
-    - name: 4.1. Reboot gerekiyor mu kontrol et (zypper ps)
+    - name: 3.2 Zypper kendini güncellediyse patch'i tekrar çalıştır
+      ansible.builtin.command: zypper patch -y
+      register: patch_result_2
+      when: patch_result_1.rc == 103
+      changed_when: "'Nothing to do.' not in patch_result_2.stdout"
+      failed_when: patch_result_2.rc not in [0, 100]
+
+    # --------------------------------------------------
+    # 4. REBOOT GEREKLİLİK KONTROLÜ
+    # --------------------------------------------------
+    - name: 4.1 Reboot gerekiyor mu kontrol et
       ansible.builtin.shell: zypper ps -s | grep -qi restart
       register: reboot_needed
       failed_when: false
       changed_when: false
 
-    # --- 5. ADIM: AKILLI REBOOT ---
-    - name: 5.1. Yama yüklendiyse veya reboot gerekiyorsa yeniden başlat
+    # --------------------------------------------------
+    # 5. AKILLI REBOOT
+    # --------------------------------------------------
+    - name: 5.1 Gerekliyse sistemi yeniden başlat
       ansible.builtin.reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         msg: "Ansible patching sonrası sistem yeniden başlatılıyor."
-      when: reboot_needed.rc == 0 or patch_result.changed
+      when: reboot_needed.rc == 0 or patch_result_1.changed
 
-    - name: 5.2. Reboot sonrası bağlantıyı bekle
+    - name: 5.2 Reboot sonrası bağlantıyı bekle
       ansible.builtin.wait_for_connection:
         timeout: "{{ reboot_timeout }}"
-      when: reboot_needed.rc == 0 or patch_result.changed
+      when: reboot_needed.rc == 0 or patch_result_1.changed
 
-    # --- 6. ADIM: İŞLEM SONRASI DURUM ---
-    - name: 6.1. Güncel (Yeni) Kernel sürümünü al
+    # --------------------------------------------------
+    # 6. İŞLEM SONRASI DURUM
+    # --------------------------------------------------
+    - name: 6.1 Güncel kernel sürümünü al
       ansible.builtin.command: uname -r
       register: post_kernel
       changed_when: false
 
-    - name: 6.2. Patch listesi (sonrası)
+    - name: 6.2 Patch listesi (sonrası)
       ansible.builtin.command: zypper list-patches
       register: patch_list_after
       changed_when: false
 
-    # --- 7. ADIM: FİNAL RAPOR ---
-    - name: 7.1. FİNAL ÖZET RAPORU
+    # --------------------------------------------------
+    # 7. FİNAL RAPOR
+    # --------------------------------------------------
+    - name: 7.1 Patch Final Raporu
       ansible.builtin.debug:
         msg:
-          - "--------------------------------------------------"
+          - "=================================================="
           - "SUNUCU: {{ inventory_hostname }}"
           - "ÖNCESİ KERNEL: {{ pre_kernel.stdout }}"
           - "SONRASI KERNEL: {{ post_kernel.stdout }}"
           - "KERNEL DURUMU: {% if pre_kernel.stdout != post_kernel.stdout %}YENİ KERNEL AKTİF{% else %}KERNEL DEĞİŞMEDİ / ZATEN GÜNCEL{% endif %}"
-          - "YAMA DURUMU: {% if patch_result.changed %}YAMALAR YÜKLENDİ{% else %}SİSTEM ZATEN GÜNCELDİ{% endif %}"
+          - "YAMA DURUMU: {% if patch_result_1.changed %}PATCH GEÇİLDİ{% else %}SİSTEM ZATEN GÜNCELDİ{% endif %}"
           - "KALDIRILAN CONFLICT PAKETLER: {{ installed_conflict_packages | default([]) }}"
-          - "KALAN PATCHLER (SONRASI): {{ patch_list_after.stdout_lines | length }} satır"
-          - "--------------------------------------------------"
+          - "KALAN PATCH SAYISI (SONRASI): {{ patch_list_after.stdout_lines | length }}"
+          - "=================================================="
