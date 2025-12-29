@@ -14,7 +14,7 @@
       register: pre_kernel
       changed_when: false
 
-    # --- 2. GÜÇLENDİRİLMİŞ YAMA İŞLEMİ ---
+    # --- patch----
     - name: 2.1 Tüm onaylı yamaları yükle (Hata Toleranslı)
       # --non-interactive: Soru sormayı engeller
       # --auto-agree-with-licenses: Lisansları onaylar
