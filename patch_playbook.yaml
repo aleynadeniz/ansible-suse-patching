@@ -1,11 +1,19 @@
 ---
-- name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi
+- name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi (AWX/K8s uyumlu)
   hosts: suse_hosts
   become: yes
-  serial: "100%"   # Aynı anda tüm hostlar (istersen 1 yapabilirsin)
+  serial: "100%"   # Aynı anda tüm hostlar. Prod için genelde 1 önerilir.
 
   vars:
     reboot_timeout: 1200
+
+    # Zypper patch sırasında en sık çakışma çıkaran (server'da çoğunlukla gereksiz) paketler
+    conflict_packages:
+      - libyui-qt-pkg16
+      - PackageKit
+      - PackageKit-backend-zypp
+      - PackageKit-lang
+      - PackageKit-branding-SLE
 
   tasks:
 
@@ -15,7 +23,7 @@
       register: pre_kernel
       changed_when: false
 
-    - name: 1.2. Bekleyen yama listesini kontrol et (bilgi amaçlı)
+    - name: 1.2. Bekleyen yama listesini kontrol et (Bilgi amaçlı)
       ansible.builtin.command: zypper list-patches
       register: patch_list_before
       changed_when: false
@@ -24,50 +32,84 @@
       ansible.builtin.debug:
         var: patch_list_before.stdout_lines
 
-    # --- 2. ADIM: YAMA UYGULAMA ---
-    - name: 2.1. Tüm onaylı yamaları yükle (zypper patch)
+    # --- 2. ADIM: PATCH ÖNCESİ DEPENDENCY CONFLICT ÖNLEME ---
+    - name: 2.0. Conflict çıkaran paketler sistemde kurulu mu kontrol et
+      ansible.builtin.shell: "rpm -q {{ item }}"
+      loop: "{{ conflict_packages }}"
+      register: conflict_pkg_check
+      failed_when: false
+      changed_when: false
+
+    - name: 2.0.1. Kurulu olan conflict paket listesini çıkar
+      ansible.builtin.set_fact:
+        installed_conflict_packages: >-
+          {{
+            conflict_pkg_check.results
+            | selectattr('rc', 'equalto', 0)
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: 2.0.2. Kurulu conflict paketleri (bilgi)
+      ansible.builtin.debug:
+        msg: "Kurulu conflict paketleri: {{ installed_conflict_packages | default([]) }}"
+
+    - name: 2.0.3. Kuruluysa conflict paketlerini kaldır (zypper interaktif kalmasın diye)
+      ansible.builtin.command: "zypper rm -y {{ installed_conflict_packages | join(' ') }}"
+      register: remove_conflict_pkgs
+      when: installed_conflict_packages | length > 0
+      changed_when: remove_conflict_pkgs.rc == 0
+      failed_when: false
+
+    # --- 3. ADIM: YAMA UYGULAMA ---
+    - name: 3.1. Tüm onaylı yamaları yükle (zypper patch)
       ansible.builtin.command: zypper patch -y
       register: patch_result
+      # "Nothing to do." yoksa değişiklik olmuştur
       changed_when: "'Nothing to do.' not in patch_result.stdout"
+      # rc != 0 olursa job fail etsin (artık interaktif kalmayacağı için beklenmez)
+      failed_when: patch_result.rc != 0
 
-    # --- 3. ADIM: REBOOT GEREKLİLİK KONTROLÜ ---
-    - name: 3.1. Reboot gerekiyor mu kontrol et
+    # --- 4. ADIM: REBOOT GEREKLİLİK KONTROLÜ ---
+    - name: 4.1. Reboot gerekiyor mu kontrol et (zypper ps)
       ansible.builtin.shell: zypper ps -s | grep -qi restart
       register: reboot_needed
       failed_when: false
       changed_when: false
 
-    # --- 4. ADIM: AKILLI REBOOT ---
-    - name: 4.1. Yama yüklendiyse veya reboot gerekiyorsa yeniden başlat
+    # --- 5. ADIM: AKILLI REBOOT ---
+    - name: 5.1. Yama yüklendiyse veya reboot gerekiyorsa yeniden başlat
       ansible.builtin.reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         msg: "Ansible patching sonrası sistem yeniden başlatılıyor."
       when: reboot_needed.rc == 0 or patch_result.changed
 
-    - name: 4.2. Reboot sonrası bağlantıyı bekle
+    - name: 5.2. Reboot sonrası bağlantıyı bekle
       ansible.builtin.wait_for_connection:
         timeout: "{{ reboot_timeout }}"
       when: reboot_needed.rc == 0 or patch_result.changed
 
-    # --- 5. ADIM: İŞLEM SONRASI DURUM ---
-    - name: 5.1. Güncel (Yeni) Kernel sürümünü al
+    # --- 6. ADIM: İŞLEM SONRASI DURUM ---
+    - name: 6.1. Güncel (Yeni) Kernel sürümünü al
       ansible.builtin.command: uname -r
       register: post_kernel
       changed_when: false
 
-    - name: 5.2. Patch listesi (sonrası)
+    - name: 6.2. Patch listesi (sonrası)
       ansible.builtin.command: zypper list-patches
       register: patch_list_after
       changed_when: false
 
-    # --- 6. ADIM: FİNAL RAPOR ---
-    - name: 6.1. FİNAL ÖZET RAPORU
+    # --- 7. ADIM: FİNAL RAPOR ---
+    - name: 7.1. FİNAL ÖZET RAPORU
       ansible.builtin.debug:
         msg:
           - "--------------------------------------------------"
           - "SUNUCU: {{ inventory_hostname }}"
           - "ÖNCESİ KERNEL: {{ pre_kernel.stdout }}"
           - "SONRASI KERNEL: {{ post_kernel.stdout }}"
-          - "KERNEL DURUMU: {% if pre_kernel.stdout != post_kernel.stdout %}YENİ KERNEL AKTİF{% else %}KERNEL DEĞİŞMEDİ{% endif %}"
+          - "KERNEL DURUMU: {% if pre_kernel.stdout != post_kernel.stdout %}YENİ KERNEL AKTİF{% else %}KERNEL DEĞİŞMEDİ / ZATEN GÜNCEL{% endif %}"
           - "YAMA DURUMU: {% if patch_result.changed %}YAMALAR YÜKLENDİ{% else %}SİSTEM ZATEN GÜNCELDİ{% endif %}"
+          - "KALDIRILAN CONFLICT PAKETLER: {{ installed_conflict_packages | default([]) }}"
+          - "KALAN PATCHLER (SONRASI): {{ patch_list_after.stdout_lines | length }} satır"
           - "--------------------------------------------------"
