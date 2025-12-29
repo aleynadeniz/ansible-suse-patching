@@ -1,0 +1,1 @@
+# ansible-suse-patching
