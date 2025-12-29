@@ -1,0 +1,65 @@
+---
+- name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi
+  hosts: suse_hosts
+  become: yes
+  # Kaç sunucu varsa hepsine aynı anda başlar
+  serial: "100%"
+
+  vars:
+    # Sunucunun açılması için beklenecek maksimum süre (saniye)
+    reboot_timeout: 1200 
+
+  tasks:
+
+    # --- 1. ADIM: İŞLEM ÖNCESİ DURUM ---
+    - name: 1.1. Mevcut (Eski) Kernel sürümünü kaydet
+      command: "uname -r"
+      register: pre_kernel
+      changed_when: false
+
+    - name: 1.2. Bekleyen yama listesini kontrol et (Bilgi amaçlı)
+      command: zypper list-patches
+      register: patch_list_before
+      changed_when: false
+
+    # --- 2. ADIM: YAMA UYGULAMA ---
+    - name: 2.1. Tüm onaylı yamaları yükle (zypper patch)
+      zypper:
+        name: '*'
+        state: latest
+        type: patch
+        update_cache: yes
+      register: patch_result
+
+    # --- 3. ADIM: REBOOT GEREKLİLİK KONTROLÜ ---
+    - name: 3.1. Reboot gerekiyor mu kontrol et
+      # zypper ps -s komutu 'restart' gerektiren süreçleri listeler
+      shell: zypper ps -s | grep -qi 'restart'
+      register: reboot_needed
+      failed_when: false
+      changed_when: false
+
+    # --- 4. ADIM: AKILLI REBOOT ---
+    - name: 4.1. Yama yüklendiyse veya reboot gerekiyorsa yeniden başlat
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Ansible Patching sonrası sistem yeni kernel ile başlatılıyor."
+      # Sadece yama geçildiyse VEYA sistem 'reboot lazım' diyorsa çalışır
+      when: reboot_needed.rc == 0 or patch_result.changed
+
+    # --- 5. ADIM: İŞLEM SONRASI DURUM VE RAPOR ---
+    - name: 5.1. Güncel (Yeni) Kernel sürümünü al
+      command: "uname -r"
+      register: post_kernel
+      changed_when: false
+
+    - name: 5.2. FİNAL ÖZET RAPORU
+      debug:
+        msg: 
+          - "--------------------------------------------------"
+          - "SUNUCU:        {{ inventory_hostname }}"
+          - "İŞLEM ÖNCESİ KERNEL:  {{ pre_kernel.stdout }}"
+          - "İŞLEM SONRASI KERNEL: {{ post_kernel.stdout }}"
+          - "DURUM: {% if pre_kernel.stdout != post_kernel.stdout %}GÜNCEL KERNEL AKTİF EDİLDİ{% else %}KERNEL DEĞİŞMEDİ / ZATEN GÜNCEL{% endif %}"
+          - "YAMA DURUMU: {% if patch_result.changed %}YENİ YAMALAR YÜKLENDİ{% else %}SİSTEM ZATEN GÜNCELDİ{% endif %}"
+          - "--------------------------------------------------"
