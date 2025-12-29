@@ -2,7 +2,7 @@
 - name: SUSE Toplu Yama (Patch) ve Kernel Kontrol Yönetimi
   hosts: suse_hosts
   become: yes
-  # Kaç sunucu varsa hepsine aynı anda başlar
+  # Envanterdeki tüm sunuculara aynı anda başlar
   serial: "100%"
 
   vars:
@@ -13,18 +13,18 @@
 
     # --- 1. ADIM: İŞLEM ÖNCESİ DURUM ---
     - name: 1.1. Mevcut (Eski) Kernel sürümünü kaydet
-      command: "uname -r"
+      ansible.builtin.command: "uname -r"
       register: pre_kernel
       changed_when: false
 
     - name: 1.2. Bekleyen yama listesini kontrol et (Bilgi amaçlı)
-      command: zypper list-patches
+      ansible.builtin.command: zypper list-patches
       register: patch_list_before
       changed_when: false
 
-    # --- 2. ADIM: YAMA UYGULAMA ---
+    # --- 2. ADIM: YAMA UYGULAMA (COLLECTION GÜNCELLEMESİ YAPILDI) ---
     - name: 2.1. Tüm onaylı yamaları yükle (zypper patch)
-      zypper:
+      community.general.zypper:
         name: '*'
         state: latest
         type: patch
@@ -33,15 +33,14 @@
 
     # --- 3. ADIM: REBOOT GEREKLİLİK KONTROLÜ ---
     - name: 3.1. Reboot gerekiyor mu kontrol et
-      # zypper ps -s komutu 'restart' gerektiren süreçleri listeler
-      shell: zypper ps -s | grep -qi 'restart'
+      ansible.builtin.shell: zypper ps -s | grep -qi 'restart'
       register: reboot_needed
       failed_when: false
       changed_when: false
 
     # --- 4. ADIM: AKILLI REBOOT ---
     - name: 4.1. Yama yüklendiyse veya reboot gerekiyorsa yeniden başlat
-      reboot:
+      ansible.builtin.reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         msg: "Ansible Patching sonrası sistem yeni kernel ile başlatılıyor."
       # Sadece yama geçildiyse VEYA sistem 'reboot lazım' diyorsa çalışır
@@ -49,12 +48,12 @@
 
     # --- 5. ADIM: İŞLEM SONRASI DURUM VE RAPOR ---
     - name: 5.1. Güncel (Yeni) Kernel sürümünü al
-      command: "uname -r"
+      ansible.builtin.command: "uname -r"
       register: post_kernel
       changed_when: false
 
     - name: 5.2. FİNAL ÖZET RAPORU
-      debug:
+      ansible.builtin.debug:
         msg: 
           - "--------------------------------------------------"
           - "SUNUCU:        {{ inventory_hostname }}"
