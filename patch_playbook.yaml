@@ -1,13 +1,41 @@
 ---
-- name: SLES 15 SP6 Full Patch (SCC Attached, Auto Reboot, No Snapshot)
+- name: SLES 15 SP6 Full Patch (SCC, Auto Reboot, Handles Zypper Lock)
   hosts: suse_hosts
   become: yes
   serial: 1
 
   vars:
     reboot_timeout: 1800
+    zypp_lock_wait_seconds: 900   # 15 dk bekle
+    zypp_lock_poll: 10            # 10 sn'de bir kontrol
 
   tasks:
+    - name: Wait until zypper/zypp lock is released
+      shell: |
+        set -e
+        # lock dosyası varsa PID yazılıdır
+        PID=""
+        if [ -f /run/zypp.pid ]; then PID=$(cat /run/zypp.pid 2>/dev/null || true); fi
+        if [ -z "$PID" ] && [ -f /var/run/zypp.pid ]; then PID=$(cat /var/run/zypp.pid 2>/dev/null || true); fi
+
+        # PID varsa ve süreç yaşıyorsa "LOCKED" de
+        if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then
+          echo "LOCKED:$PID"
+          exit 1
+        fi
+
+        # PID yok ama zypper çalışıyor mu? (ek güvenlik)
+        if pgrep -x zypper >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
+          echo "LOCKED:PROCESS"
+          exit 1
+        fi
+
+        echo "UNLOCKED"
+      register: lock_check
+      retries: "{{ (zypp_lock_wait_seconds // zypp_lock_poll) | int }}"
+      delay: "{{ zypp_lock_poll }}"
+      until: lock_check.rc == 0
+      changed_when: false
 
     - name: Get kernel before patch
       command: uname -r
@@ -48,20 +76,11 @@
       failed_when: patch_result_second.rc not in [0, 102, 4]
       changed_when: "'Nothing to do.' not in patch_result_second.stdout"
 
-    - name: Check reboot requirement file
-      stat:
-        path: /run/reboot-needed
-      register: reboot_file
-      failed_when: false
-
     - name: Reboot if required
       reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         msg: "System reboot after patching"
-      when: >
-        patch_result.rc == 102 or
-        (patch_result_second is defined and patch_result_second.rc == 102) or
-        reboot_file.stat.exists
+      when: patch_result.rc == 102 or (patch_result_second is defined and patch_result_second.rc == 102)
 
     - name: Get kernel after patch
       command: uname -r
@@ -71,11 +90,9 @@
     - name: Patch Summary
       debug:
         msg:
-          - "-----------------------------------------"
           - "Host: {{ inventory_hostname }}"
           - "Kernel Before : {{ pre_kernel.stdout }}"
           - "Kernel After  : {{ post_kernel.stdout }}"
           - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
           - "Patch RC1     : {{ patch_result.rc }}"
           - "Patch RC2     : {{ patch_result_second.rc if patch_result_second is defined else 'N/A' }}"
-          - "-----------------------------------------"
