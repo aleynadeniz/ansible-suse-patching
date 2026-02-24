@@ -1,5 +1,5 @@
 ---
-- name: SLES 15 SP6 Safe Patch (No Snapshot)
+- name: SLES 15 SP6 Patch via SCC (GUI Safe)
   hosts: suse_hosts
   become: yes
   serial: 1
@@ -9,72 +9,39 @@
 
   tasks:
 
-    - name: Check OS Version
-      command: cat /etc/os-release
-      register: os_check
+    - name: Check PackageHub status
+      command: SUSEConnect --status-text
+      register: scc_status
       changed_when: false
 
-    - name: Fail if not SLES 15 SP6
-      fail:
-        msg: "This playbook only supports SLES 15 SP6"
-      when: "'15-SP6' not in os_check.stdout"
-
-    - name: Get kernel before patch
-      command: uname -r
-      register: pre_kernel
-      changed_when: false
+    - name: Attach PackageHub if missing
+      command: SUSEConnect -p PackageHub/15.6/x86_64
+      when: "'PackageHub 15 SP6 x86_64' not in scc_status.stdout"
+      register: phub_attach
+      failed_when: false
 
     - name: Refresh repositories
       command: zypper --non-interactive refresh
       changed_when: false
 
-    - name: Apply patches safely
+    - name: Apply patches
       command: >
         zypper --non-interactive patch
         --auto-agree-with-licenses
         --no-recommends
-        --replacefiles
         --skip-interactive
       register: patch_result
-      failed_when: patch_result.rc not in [0,102,103]
+      failed_when: patch_result.rc not in [0,102,4]
       changed_when: "'Nothing to do.' not in patch_result.stdout"
 
-    - name: Run patch again if zypper updated
-      command: >
-        zypper --non-interactive patch
-        --auto-agree-with-licenses
-        --no-recommends
-        --replacefiles
-        --skip-interactive
-      when: patch_result.rc == 103
-      register: second_run
-      failed_when: second_run.rc not in [0,102]
-      changed_when: "'Nothing to do.' not in second_run.stdout"
-
-    - name: Check if reboot required
-      command: zypper ps -s
-      register: reboot_check
-      changed_when: false
-      failed_when: false
-
-    - name: Reboot if needed
+    - name: Reboot if required
       reboot:
         reboot_timeout: "{{ reboot_timeout }}"
-        msg: "Reboot after SLES patching"
-      when: patch_result.rc == 102 or
-            (second_run is defined and second_run.rc == 102)
+        msg: "Reboot after patching"
+      when: patch_result.rc == 102
 
-    - name: Get kernel after patch
-      command: uname -r
-      register: post_kernel
-      changed_when: false
-
-    - name: Patch Summary
+    - name: Show result
       debug:
         msg:
-          - "----------------------------------------"
-          - "Host: {{ inventory_hostname }}"
-          - "Kernel Before: {{ pre_kernel.stdout }}"
-          - "Kernel After : {{ post_kernel.stdout }}"
-          - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
-          - "----------------------------------------"
+          - "Return code: {{ patch_result.rc }}"
+          - "Reboot required: {{ patch_result.rc == 102 }}"
