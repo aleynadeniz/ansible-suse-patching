@@ -4,40 +4,44 @@
   become: yes
   serial: 1
 
+  vars:
+    reboot_timeout: 1800
+
   tasks:
-    - name: Kernel version before
+    - name: 1. Get current kernel version
       command: uname -r
       register: pre_kernel
       changed_when: false
 
-    - name: Run full dist-upgrade (dup)
-      zypper:
-        name: '*'
-        state: dist-upgrade
-        extra_args: '--auto-agree-with-licenses'
-      register: zypper_result
-
-    # Çözüm: zypper ps (veya zypper-needs-restarting) kullanarak kontrol etme
-    - name: Check if reboot is required (zypper ps)
-      command: zypper ps -s
-      register: reboot_required
-      failed_when: false
+    - name: 2. Refresh repositories
+      command: zypper --non-interactive refresh
       changed_when: false
 
-    - name: Reboot the server if kernel or libraries updated
-      reboot:
-        reboot_timeout: 1800
-      # Eğer zypper 102 döndüyse VEYA zypper ps içinde reboot mesajı varsa reboot et
-      when: (zypper_result.rc == 102) or ('reboot' in reboot_required.stdout.lower())
+    - name: 3. Run full dist-upgrade (dup)
+      command: zypper --non-interactive dup -y --auto-agree-with-licenses
+      register: dup_result
+      # 102: reboot required, 0: success
+      failed_when: dup_result.rc not in [0, 102]
 
-    - name: Kernel version after
+    - name: 4. Check if kernel or libraries need reboot
+      shell: "zypper ps -s | grep -i 'reboot' || true"
+      register: reboot_check
+      changed_when: false
+
+    - name: 5. Reboot the server if needed
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      # Eğer zypper 102 döndüyse VEYA çıktı boş değilse (reboot kelimesi geçtiyse) reboot et
+      when: (dup_result.rc == 102) or (reboot_check.stdout != "")
+
+    - name: 6. Get new kernel version
       command: uname -r
       register: post_kernel
       changed_when: false
 
-    - name: Summary
+    - name: 7. Summary of the operation
       debug:
         msg:
-          - "Kernel before: {{ pre_kernel.stdout }}"
-          - "Kernel after : {{ post_kernel.stdout }}"
-          - "Status: {{ 'UPDATED & REBOOTED' if pre_kernel.stdout != post_kernel.stdout else 'NO KERNEL CHANGE' }}"
+          - "Kernel before update : {{ pre_kernel.stdout }}"
+          - "Kernel after update  : {{ post_kernel.stdout }}"
+          - "Kernel was updated   : {{ pre_kernel.stdout != post_kernel.stdout }}"
