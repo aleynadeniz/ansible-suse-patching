@@ -1,69 +1,80 @@
 ---
-- name: SUSE Kurumsal Toplu Yama (Patch) Yönetimi
+- name: SLES 15 SP6 Safe Patch (No Snapshot)
   hosts: suse_hosts
   become: yes
-  serial: "100%"  # Tüm sunuculara aynı anda başlar
+  serial: 1
 
   vars:
-    reboot_timeout: 1200
+    reboot_timeout: 1800
 
   tasks:
-    # --- 1. ÖN KONTROLLER ---
-    - name: 1.1 Mevcut kernel sürümünü al
-      ansible.builtin.command: uname -r
+
+    - name: Check OS Version
+      command: cat /etc/os-release
+      register: os_check
+      changed_when: false
+
+    - name: Fail if not SLES 15 SP6
+      fail:
+        msg: "This playbook only supports SLES 15 SP6"
+      when: "'15-SP6' not in os_check.stdout"
+
+    - name: Get kernel before patch
+      command: uname -r
       register: pre_kernel
       changed_when: false
 
-    # --- patch----
-    - name: 2.1 Tüm onaylı yamaları yükle (Hata Toleranslı)
-      # --non-interactive: Soru sormayı engeller
-      # --auto-agree-with-licenses: Lisansları onaylar
-      # --no-recommends: Sadece gerekli paketleri yükler, çakışma riskini azaltır
-      ansible.builtin.command: zypper --non-interactive patch -y --auto-agree-with-licenses --no-recommends
-      register: patch_result_1
-      # zypper çıktısında 'Nothing to do' yoksa değişmiş say
-      changed_when: "'Nothing to do.' not in patch_result_1.stdout"
-      # Başarı Kodları:
-      # 0: Başarılı
-      # 102: Başarılı (Reboot gerekli)
-      # 103: Başarılı (Zypper kendini güncelledi)
-      # 4: Bağımlılık sorunu (Sorunlu yamayı atladı, diğerlerini kurdu)
-      failed_when: patch_result_1.rc not in [0, 102, 103, 4]
-
-    - name: 2.2 Zypper kendini güncellediyse işlemi tekrarla
-      ansible.builtin.command: zypper --non-interactive patch -y --auto-agree-with-licenses --no-recommends
-      register: patch_result_2
-      when: patch_result_1.rc == 103
-      changed_when: "'Nothing to do.' not in patch_result_2.stdout"
-      failed_when: patch_result_2.rc not in [0, 102, 100, 4]
-
-    # --- 3. REBOOT KONTROLÜ ---
-    - name: 3.1 Reboot gerekliliğini kontrol et
-      ansible.builtin.shell: zypper ps -s | grep -qi restart
-      register: reboot_needed
-      failed_when: false
+    - name: Refresh repositories
+      command: zypper --non-interactive refresh
       changed_when: false
 
-    # --- 4. AKILLI REBOOT ---
-    - name: 4.1 Gerekliyse sistemi yeniden başlat
-      ansible.builtin.reboot:
-        reboot_timeout: "{{ reboot_timeout }}"
-        msg: "Ansible toplu patching sonrası sistem yeniden başlatılıyor."
-      when: reboot_needed.rc == 0 or patch_result_1.changed
+    - name: Apply patches safely
+      command: >
+        zypper --non-interactive patch
+        --auto-agree-with-licenses
+        --no-recommends
+        --replacefiles
+        --skip-interactive
+      register: patch_result
+      failed_when: patch_result.rc not in [0,102,103]
+      changed_when: "'Nothing to do.' not in patch_result.stdout"
 
-    # --- 5. FİNAL RAPORLAMA ---
-    - name: 5.1 Güncel kernel sürümünü al
-      ansible.builtin.command: uname -r
+    - name: Run patch again if zypper updated
+      command: >
+        zypper --non-interactive patch
+        --auto-agree-with-licenses
+        --no-recommends
+        --replacefiles
+        --skip-interactive
+      when: patch_result.rc == 103
+      register: second_run
+      failed_when: second_run.rc not in [0,102]
+      changed_when: "'Nothing to do.' not in second_run.stdout"
+
+    - name: Check if reboot required
+      command: zypper ps -s
+      register: reboot_check
+      changed_when: false
+      failed_when: false
+
+    - name: Reboot if needed
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Reboot after SLES patching"
+      when: patch_result.rc == 102 or
+            (second_run is defined and second_run.rc == 102)
+
+    - name: Get kernel after patch
+      command: uname -r
       register: post_kernel
       changed_when: false
 
-    - name: 5.2 ÖZET RAPOR
-      ansible.builtin.debug:
+    - name: Patch Summary
+      debug:
         msg:
-          - "--------------------------------------------------"
-          - "SUNUCU: {{ inventory_hostname }}"
-          - "İŞLEM ÖNCESİ KERNEL: {{ pre_kernel.stdout }}"
-          - "İŞLEM SONRASI KERNEL: {{ post_kernel.stdout }}"
-          - "KERNEL GÜNCELLENDİ Mİ: {% if pre_kernel.stdout != post_kernel.stdout %}EVET{% else %}HAYIR{% endif %}"
-          - "BAĞIMLILIK SORUNU YAŞANDI MI: {% if patch_result_1.rc == 4 %}EVET (Bazı yamalar atlandı){% else %}HAYIR{% endif %}"
-          - "--------------------------------------------------"
+          - "----------------------------------------"
+          - "Host: {{ inventory_hostname }}"
+          - "Kernel Before: {{ pre_kernel.stdout }}"
+          - "Kernel After : {{ post_kernel.stdout }}"
+          - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
+          - "----------------------------------------"
