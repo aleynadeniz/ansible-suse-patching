@@ -1,32 +1,26 @@
 ---
-- name: SLES 15 SP6 Full Patch (SCC, Auto Reboot, Handles Zypper Lock)
+- name: SLES 15 SP6 Patch + Ensure New Kernel Boot
   hosts: suse_hosts
   become: yes
   serial: 1
 
   vars:
     reboot_timeout: 1800
-    zypp_lock_wait_seconds: 900   # 15 dk bekle
-    zypp_lock_poll: 10            # 10 sn'de bir kontrol
+    zypp_lock_wait_seconds: 900
+    zypp_lock_poll: 10
 
   tasks:
     - name: Wait until zypper/zypp lock is released
       shell: |
-        set -e
         PID=""
         if [ -f /run/zypp.pid ]; then PID=$(cat /run/zypp.pid 2>/dev/null || true); fi
         if [ -z "$PID" ] && [ -f /var/run/zypp.pid ]; then PID=$(cat /var/run/zypp.pid 2>/dev/null || true); fi
-
         if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then
-          echo "LOCKED:$PID"
-          exit 1
+          echo "LOCKED:$PID"; exit 1
         fi
-
         if pgrep -x zypper >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
-          echo "LOCKED:PROCESS"
-          exit 1
+          echo "LOCKED:PROCESS"; exit 1
         fi
-
         echo "UNLOCKED"
       register: lock_check
       retries: "{{ (zypp_lock_wait_seconds // zypp_lock_poll) | int }}"
@@ -34,18 +28,18 @@
       until: lock_check.rc == 0
       changed_when: false
 
-    - name: Get kernel before patch
+    - name: Kernel before
       command: uname -r
-      register: pre_kernel
+      register: pre_uname
       changed_when: false
 
-    - name: Check SCC module status
+    - name: SCC status (ignore lock errors just in case)
       command: SUSEConnect --status-text
       register: scc_status
       changed_when: false
       failed_when: false
 
-    - name: Attach PackageHub if not attached
+    - name: Attach PackageHub if missing
       command: SUSEConnect -p PackageHub/15.6/x86_64
       when: scc_status.stdout is defined and ('PackageHub 15 SP6 x86_64' not in scc_status.stdout)
       register: phub_attach
@@ -55,55 +49,85 @@
       command: zypper --non-interactive refresh
       changed_when: false
 
-    - name: Apply full patch (auto yes, non-interactive)
+    - name: Apply full patch (this must actually run)
       command: >
         zypper --non-interactive patch -y
         --auto-agree-with-licenses
         --no-recommends
       register: patch_result
-      failed_when: patch_result.rc is defined and (patch_result.rc not in [0, 102, 103, 4])
+      failed_when: patch_result.rc not in [0, 102, 103, 4]
       changed_when: patch_result.stdout is defined and ('Nothing to do.' not in patch_result.stdout)
 
-    - name: Re-run patch if zypper updated itself
+    - name: Re-run patch if zypper updated itself (rc=103)
       command: >
         zypper --non-interactive patch -y
         --auto-agree-with-licenses
         --no-recommends
-      when: patch_result is defined and (patch_result.rc | default(0) == 103)
-      register: patch_result_second
-      failed_when: patch_result_second.rc is defined and (patch_result_second.rc not in [0, 102, 4])
-      changed_when: patch_result_second.stdout is defined and ('Nothing to do.' not in patch_result_second.stdout)
+      when: patch_result.rc == 103
+      register: patch_result_2
+      failed_when: patch_result_2.rc not in [0, 102, 4]
+      changed_when: patch_result_2.stdout is defined and ('Nothing to do.' not in patch_result_2.stdout)
 
-    # Güvenli rc değişkenleri (rc yoksa 0 say)
-    - name: Set safe patch rc variables
+    - name: Set safe patch RCs
       set_fact:
         patch_rc1: "{{ patch_result.rc | default(0) }}"
-        patch_rc2: "{{ patch_result_second.rc | default(0) }}"
+        patch_rc2: "{{ patch_result_2.rc | default(0) }}"
       changed_when: false
 
-    - name: Check if any processes require restart (zypper ps)
-      command: zypper ps -s
-      register: zypper_ps
+    - name: Reboot if zypper says reboot needed
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Reboot after patching"
+      when: patch_rc1 == 102 or patch_rc2 == 102
+
+    # ---- Post checks ----
+    - name: Kernel after reboot (running)
+      command: uname -r
+      register: post_uname
+      changed_when: false
+
+    - name: Installed kernel-default packages
+      command: rpm -q kernel-default
+      register: kernel_pkgs
       changed_when: false
       failed_when: false
 
-    - name: Reboot if required
+    - name: Newest installed kernel version-release
+      shell: |
+        rpm -q kernel-default --qf '%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort -V | tail -n 1
+      register: newest_kernel
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure grub config exists
+      command: grub2-mkconfig -o /boot/grub2/grub.cfg
+      when: newest_kernel.stdout is defined and newest_kernel.stdout|length > 0 and (newest_kernel.stdout not in post_uname.stdout)
+      changed_when: true
+
+    - name: Set default boot entry to 0 (usually newest kernel)
+      command: grub2-set-default 0
+      when: newest_kernel.stdout is defined and newest_kernel.stdout|length > 0 and (newest_kernel.stdout not in post_uname.stdout)
+      changed_when: true
+
+    - name: Reboot again if newest kernel installed but not running
       reboot:
         reboot_timeout: "{{ reboot_timeout }}"
-        msg: "System reboot after patching"
-      when: patch_rc1 == 102 or patch_rc2 == 102 or (zypper_ps.stdout is defined and 'restart' in zypper_ps.stdout | lower)
+        msg: "Reboot to load newest installed kernel"
+      when: newest_kernel.stdout is defined and newest_kernel.stdout|length > 0 and (newest_kernel.stdout not in post_uname.stdout)
 
-    - name: Get kernel after patch
+    - name: Final running kernel
       command: uname -r
-      register: post_kernel
+      register: final_uname
       changed_when: false
 
-    - name: Patch Summary
+    - name: Summary
       debug:
         msg:
           - "Host: {{ inventory_hostname }}"
-          - "Kernel Before : {{ pre_kernel.stdout }}"
-          - "Kernel After  : {{ post_kernel.stdout }}"
-          - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
-          - "Patch RC1     : {{ patch_rc1 }}"
-          - "Patch RC2     : {{ patch_rc2 }}"
+          - "Kernel before: {{ pre_uname.stdout }}"
+          - "Kernel after patch reboot: {{ post_uname.stdout }}"
+          - "Installed kernels: {{ kernel_pkgs.stdout_lines | default([]) }}"
+          - "Newest installed kernel: {{ newest_kernel.stdout | default('') }}"
+          - "Final running kernel: {{ final_uname.stdout }}"
+          - "Patch RC1: {{ patch_rc1 }}"
+          - "Patch RC2: {{ patch_rc2 }}"
