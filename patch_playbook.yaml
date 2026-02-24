@@ -13,18 +13,15 @@
     - name: Wait until zypper/zypp lock is released
       shell: |
         set -e
-        # lock dosyası varsa PID yazılıdır
         PID=""
         if [ -f /run/zypp.pid ]; then PID=$(cat /run/zypp.pid 2>/dev/null || true); fi
         if [ -z "$PID" ] && [ -f /var/run/zypp.pid ]; then PID=$(cat /var/run/zypp.pid 2>/dev/null || true); fi
 
-        # PID varsa ve süreç yaşıyorsa "LOCKED" de
         if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then
           echo "LOCKED:$PID"
           exit 1
         fi
 
-        # PID yok ama zypper çalışıyor mu? (ek güvenlik)
         if pgrep -x zypper >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
           echo "LOCKED:PROCESS"
           exit 1
@@ -46,10 +43,11 @@
       command: SUSEConnect --status-text
       register: scc_status
       changed_when: false
+      failed_when: false
 
     - name: Attach PackageHub if not attached
       command: SUSEConnect -p PackageHub/15.6/x86_64
-      when: "'PackageHub 15 SP6 x86_64' not in scc_status.stdout"
+      when: scc_status.stdout is defined and ('PackageHub 15 SP6 x86_64' not in scc_status.stdout)
       register: phub_attach
       failed_when: false
 
@@ -63,24 +61,37 @@
         --auto-agree-with-licenses
         --no-recommends
       register: patch_result
-      failed_when: patch_result.rc not in [0, 102, 103, 4]
-      changed_when: "'Nothing to do.' not in patch_result.stdout"
+      failed_when: patch_result.rc is defined and (patch_result.rc not in [0, 102, 103, 4])
+      changed_when: patch_result.stdout is defined and ('Nothing to do.' not in patch_result.stdout)
 
     - name: Re-run patch if zypper updated itself
       command: >
         zypper --non-interactive patch -y
         --auto-agree-with-licenses
         --no-recommends
-      when: patch_result.rc == 103
+      when: patch_result is defined and (patch_result.rc | default(0) == 103)
       register: patch_result_second
-      failed_when: patch_result_second.rc not in [0, 102, 4]
-      changed_when: "'Nothing to do.' not in patch_result_second.stdout"
+      failed_when: patch_result_second.rc is defined and (patch_result_second.rc not in [0, 102, 4])
+      changed_when: patch_result_second.stdout is defined and ('Nothing to do.' not in patch_result_second.stdout)
+
+    # Güvenli rc değişkenleri (rc yoksa 0 say)
+    - name: Set safe patch rc variables
+      set_fact:
+        patch_rc1: "{{ patch_result.rc | default(0) }}"
+        patch_rc2: "{{ patch_result_second.rc | default(0) }}"
+      changed_when: false
+
+    - name: Check if any processes require restart (zypper ps)
+      command: zypper ps -s
+      register: zypper_ps
+      changed_when: false
+      failed_when: false
 
     - name: Reboot if required
       reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         msg: "System reboot after patching"
-      when: patch_result.rc == 102 or (patch_result_second is defined and patch_result_second.rc == 102)
+      when: patch_rc1 == 102 or patch_rc2 == 102 or (zypper_ps.stdout is defined and 'restart' in zypper_ps.stdout | lower)
 
     - name: Get kernel after patch
       command: uname -r
@@ -94,5 +105,5 @@
           - "Kernel Before : {{ pre_kernel.stdout }}"
           - "Kernel After  : {{ post_kernel.stdout }}"
           - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
-          - "Patch RC1     : {{ patch_result.rc }}"
-          - "Patch RC2     : {{ patch_result_second.rc if patch_result_second is defined else 'N/A' }}"
+          - "Patch RC1     : {{ patch_rc1 }}"
+          - "Patch RC2     : {{ patch_rc2 }}"
