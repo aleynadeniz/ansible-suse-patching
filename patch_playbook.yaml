@@ -1,5 +1,5 @@
 ---
-- name: SLES 15 SP6 Patch via SCC (GUI Safe)
+- name: SLES 15 SP6 Full Patch (SCC Attached, Auto Reboot, No Snapshot)
   hosts: suse_hosts
   become: yes
   serial: 1
@@ -9,12 +9,17 @@
 
   tasks:
 
-    - name: Check PackageHub status
+    - name: Get kernel before patch
+      command: uname -r
+      register: pre_kernel
+      changed_when: false
+
+    - name: Check SCC module status
       command: SUSEConnect --status-text
       register: scc_status
       changed_when: false
 
-    - name: Attach PackageHub if missing
+    - name: Attach PackageHub if not attached
       command: SUSEConnect -p PackageHub/15.6/x86_64
       when: "'PackageHub 15 SP6 x86_64' not in scc_status.stdout"
       register: phub_attach
@@ -24,24 +29,53 @@
       command: zypper --non-interactive refresh
       changed_when: false
 
-    - name: Apply patches
+    - name: Apply full patch (auto yes, non-interactive)
       command: >
-        zypper --non-interactive patch
+        zypper --non-interactive patch -y
         --auto-agree-with-licenses
         --no-recommends
-        --skip-interactive
       register: patch_result
-      failed_when: patch_result.rc not in [0,102,4]
+      failed_when: patch_result.rc not in [0, 102, 103, 4]
       changed_when: "'Nothing to do.' not in patch_result.stdout"
+
+    - name: Re-run patch if zypper updated itself
+      command: >
+        zypper --non-interactive patch -y
+        --auto-agree-with-licenses
+        --no-recommends
+      when: patch_result.rc == 103
+      register: patch_result_second
+      failed_when: patch_result_second.rc not in [0, 102, 4]
+      changed_when: "'Nothing to do.' not in patch_result_second.stdout"
+
+    - name: Check reboot requirement file
+      stat:
+        path: /run/reboot-needed
+      register: reboot_file
+      failed_when: false
 
     - name: Reboot if required
       reboot:
         reboot_timeout: "{{ reboot_timeout }}"
-        msg: "Reboot after patching"
-      when: patch_result.rc == 102
+        msg: "System reboot after patching"
+      when: >
+        patch_result.rc == 102 or
+        (patch_result_second is defined and patch_result_second.rc == 102) or
+        reboot_file.stat.exists
 
-    - name: Show result
+    - name: Get kernel after patch
+      command: uname -r
+      register: post_kernel
+      changed_when: false
+
+    - name: Patch Summary
       debug:
         msg:
-          - "Return code: {{ patch_result.rc }}"
-          - "Reboot required: {{ patch_result.rc == 102 }}"
+          - "-----------------------------------------"
+          - "Host: {{ inventory_hostname }}"
+          - "Kernel Before : {{ pre_kernel.stdout }}"
+          - "Kernel After  : {{ post_kernel.stdout }}"
+          - "Kernel Updated: {{ pre_kernel.stdout != post_kernel.stdout }}"
+          - "Patch RC1     : {{ patch_result.rc }}"
+          - "Patch RC2     : {{ patch_result_second.rc if patch_result_second is defined else 'N/A' }}"
+          - "-----------------------------------------"
